@@ -16,6 +16,10 @@
 // - Buzzer
 // - Calibrating and managing different soldering tips
 // - Storing user settings into the EEPROM
+// - Tip change detection
+// - Can be used with either N or P channel mosfets
+// - Screen flip support
+// - Rotary encoder reverse support
 //
 // Power supply should be in the range of 16V/2A to 24V/3A and well
 // stabilized.
@@ -24,26 +28,45 @@
 // wait at least three minutes after switching on the soldering station before 
 // you start the calibration process.
 //
-// Clockspeed 16 MHz external.
+// Controller:  ATmega328p
+// Core:        Barebones ATmega (https://github.com/carlosefr/atmega)
+// Clockspeed:  16 MHz external
 //
-// 2019/2020 by Stefan Wagner with great support from John Glavinos
-
+// It is recommended not to use a bootloader!
+//
+// Thank you for the code contributions:
+// - John Glavinos, https://youtu.be/4YDcWfOQmz4
+// - createskyblue, https://github.com/createskyblue
+// - TaaraLabs, https://github.com/TaaraLabs
+// - muink, https://github.com/muink
+//
+// 2019 - 2022 by Stefan Wagner
+// Project Files (EasyEDA): https://easyeda.com/wagiminator
+// Project Files (Github):  https://github.com/wagiminator
+// License: http://creativecommons.org/licenses/by-sa/3.0/
 
 
 // Libraries
-#include <U8glib.h>
-#include <EEPROM.h>
-#include <PID_v1.h>
-#include <avr/sleep.h>
+#include <U8glib.h>             // https://github.com/olikraus/u8glib
+#include <PID_v1.h>             // https://github.com/wagiminator/ATmega-Soldering-Station/blob/master/software/libraries/Arduino-PID-Library.zip 
+                                // (old cpp version of https://github.com/mblythe86/C-PID-Library/tree/master/PID_v1)
+#include <EEPROM.h>             // for storing user settings into EEPROM
+#include <avr/sleep.h>          // for sleeping during ADC sampling
 
 // Firmware version
-#define VERSION       "v1.3"
+#define VERSION       "v1.9"
+
+// Type of MOSFET
+#define N_MOSFET                // P_MOSFET or N_MOSFET
+
+// Type of OLED Controller
+#define SH1106                  // SSD1306 or SH1106
 
 // Type of rotary encoder
-#define ROTARY_TYPE   1         // 0: 2 increments/step; 1: 4 increments/step
+#define ROTARY_TYPE   1         // 0: 2 increments/step; 1: 4 increments/step (default)
 
 // Pins
-#define SENSOR_PIN    A0        // temperature sense
+#define SENSOR_PIN    A0        // tip temperature sense
 #define VIN_PIN       A1        // input voltage sense
 #define BUZZER_PIN     5        // buzzer
 #define BUTTON_PIN     6        // rotary encoder switch
@@ -75,12 +98,29 @@
 #define TIMEOFBOOST   40        // time to stay in boost mode in seconds
 
 // Control values
-#define PID_ENABLE    true      // enable PID control
+#define TIME2SETTLE   950       // time in microseconds to allow OpAmp output to settle
+#define SMOOTHIE      0.05      // OpAmp output smooth factor (1=no smoothing; 0.05 default)
+#define PID_ENABLE    false     // enable PID control
 #define BEEP_ENABLE   true      // enable/disable buzzer
+#define BODYFLIP      false     // enable/disable screen flip
+#define ECREVERSE     false     // enable/disable rotary encoder reverse
 #define MAINSCREEN    0         // type of main screen (0: big numbers; 1: more infos)
 
 // EEPROM identifier
-#define EEPROM_IDENT   0xE76C   // to identify if EEPROM was written by this program
+#define EEPROM_IDENT  0xE76C   // to identify if EEPROM was written by this program
+
+// MOSFET control definitions
+#if defined (P_MOSFET)         // P-Channel MOSFET
+  #define HEATER_ON   255
+  #define HEATER_OFF  0
+  #define HEATER_PWM  255 - Output
+#elif defined (N_MOSFET)       // N-Channel MOSFET
+  #define HEATER_ON   0
+  #define HEATER_OFF  255
+  #define HEATER_PWM  Output
+#else
+  #error Wrong MOSFET type!
+#endif
 
 // Define the aggressive and conservative PID tuning parameters
 double aggKp=11, aggKi=0.5, aggKd=1;
@@ -96,6 +136,8 @@ uint8_t   timeOfBoost = TIMEOFBOOST;
 uint8_t   MainScrType = MAINSCREEN;
 bool      PIDenable   = PID_ENABLE;
 bool      beepEnable  = BEEP_ENABLE;
+bool      BodyFlip    = BODYFLIP;
+bool      ECReverse   = ECREVERSE;
 
 // Default values for tips
 uint16_t  CalTemp[TIPMAX][4] = {TEMP200, TEMP280, TEMP360, TEMPCHP};
@@ -106,7 +148,7 @@ uint8_t   NumberOfTips = 1;
 // Menu items
 const char *SetupItems[]       = { "Setup Menu", "Tip Settings", "Temp Settings",
                                    "Timer Settings", "Control Type", "Main Screen",
-                                   "Buzzer", "Information", "Return" };
+                                   "Buzzer", "Screen Flip", "EC Reverse", "Information", "Return" };
 const char *TipItems[]         = { "Tip:", "Change Tip", "Calibrate Tip", 
                                    "Rename Tip", "Delete Tip", "Add new Tip", "Return" };
 const char *TempItems[]        = { "Temp Settings", "Default Temp", "Sleep Temp", 
@@ -118,9 +160,11 @@ const char *MainScreenItems[]  = { "Main Screen", "Big Numbers", "More Infos" };
 const char *StoreItems[]       = { "Store Settings ?", "No", "Yes" };
 const char *SureItems[]        = { "Are you sure ?", "No", "Yes" };
 const char *BuzzerItems[]      = { "Buzzer", "Disable", "Enable" };
-const char *DefaultTempItems[] = { "Default Temp", "deg C" };
-const char *SleepTempItems[]   = { "Sleep Temp", "deg C" };
-const char *BoostTempItems[]   = { "Boost Temp", "deg C" };
+const char *FlipItems[]        = { "Screen Flip", "Disable", "Enable" };
+const char *ECReverseItems[]   = { "EC Reverse", "Disable", "Enable" };
+const char *DefaultTempItems[] = { "Default Temp", "\xB0""C" };
+const char *SleepTempItems[]   = { "Sleep Temp", "\xB0""C" };
+const char *BoostTempItems[]   = { "Boost Temp", "\xB0""C" };
 const char *SleepTimerItems[]  = { "Sleep Timer", "Minutes" };
 const char *OffTimerItems[]    = { "Off Timer", "Minutes" };
 const char *BoostTimerItems[]  = { "Boost Timer", "Seconds" };
@@ -147,6 +191,7 @@ bool      inBoostMode = false;
 bool      inCalibMode = false;
 bool      isWorky     = true;
 bool      beepIfWorky = true;
+bool      TipIsPresent= true;
 
 // Timing variables
 uint32_t  sleepmillis;
@@ -156,17 +201,17 @@ uint8_t   goneMinutes;
 uint8_t   goneSeconds;
 uint8_t   SensorCounter = 255;
 
-// Control variables
-uint16_t  time2settle = 300;
-
-// Specify the links and initial PID tuning parameters
+// Specify variable pointers and initial PID tuning parameters
 PID ctrl(&Input, &Output, &Setpoint, aggKp, aggKi, aggKd, REVERSE);
  
-// Setup u8g object (OLED 128x64, Fast I2C)
-U8GLIB_SSD1306_128X64 u8g(U8G_I2C_OPT_DEV_0|U8G_I2C_OPT_NO_ACK|U8G_I2C_OPT_FAST);
-
-
-
+// Setup u8g object depending on OLED controller
+#if defined (SSD1306)
+  U8GLIB_SSD1306_128X64 u8g(U8G_I2C_OPT_DEV_0|U8G_I2C_OPT_NO_ACK|U8G_I2C_OPT_FAST);
+#elif defined (SH1106)
+  U8GLIB_SH1106_128X64 u8g(U8G_I2C_OPT_FAST|U8G_I2C_OPT_NO_ACK);
+#else
+  #error Wrong OLED controller type!
+#endif
 
 
 void setup() { 
@@ -180,7 +225,7 @@ void setup() {
   pinMode(BUTTON_PIN,   INPUT_PULLUP);
   pinMode(SWITCH_PIN,   INPUT_PULLUP);
   
-  analogWrite(CONTROL_PIN, 255);        // this shuts off the heater
+  analogWrite(CONTROL_PIN, HEATER_OFF); // this shuts off the heater
   digitalWrite(BUZZER_PIN, LOW);        // must be LOW when buzzer not in use
 
   // setup ADC
@@ -202,6 +247,9 @@ void setup() {
   // get default values from EEPROM
   getEEPROM();
 
+  // set screen flip
+  SetFlip();
+
   // read supply voltages in mV
   Vcc = getVCC(); Vin = getVIN();
 
@@ -212,12 +260,10 @@ void setup() {
   calculateTemp();
 
   // turn on heater if iron temperature is well below setpoint
-  if ((CurrentTemp + 20) < DefaultTemp) analogWrite(CONTROL_PIN, 0);
+  if ((CurrentTemp + 20) < DefaultTemp) analogWrite(CONTROL_PIN, HEATER_ON);
 
-  // tell the PID to range between 0 and the full window size
+  // set PID output range and start the PID
   ctrl.SetOutputLimits(0, 255);
-
-  // start PID
   ctrl.SetMode(AUTOMATIC);
 
   // set initial rotary encoder values
@@ -280,7 +326,7 @@ void SLEEPCheck() {
   if (handleMoved) {                    // if handle was moved
     if (inSleepMode) {                  // in sleep or off mode?
       if ((CurrentTemp + 20) < SetTemp) // if temp is well below setpoint
-        analogWrite(CONTROL_PIN, 0);    // then start the heater right now
+        analogWrite(CONTROL_PIN, HEATER_ON);    // then start the heater right now
       beep();                           // beep on wake-up
       beepIfWorky = true;               // beep again when working temperature is reached
     }
@@ -299,21 +345,22 @@ void SLEEPCheck() {
 
 // reads temperature, vibration switch and supply voltages
 void SENSORCheck() {
-  analogWrite(CONTROL_PIN, 255);              // shut off heater in order to measure temperature
-  delayMicroseconds(time2settle);             // wait for voltage to settle
+  analogWrite(CONTROL_PIN, HEATER_OFF);       // shut off heater in order to measure temperature
+  delayMicroseconds(TIME2SETTLE);             // wait for voltage to settle
   
-  uint16_t temp = denoiseAnalog(SENSOR_PIN);  // read ADC value for temperature
+  double temp = denoiseAnalog(SENSOR_PIN);    // read ADC value for temperature
   uint8_t d = digitalRead(SWITCH_PIN);        // check handle vibration switch
   if (d != d0) {handleMoved = true; d0 = d;}  // set flag if handle was moved
   if (! SensorCounter--) Vin = getVIN();      // get Vin every now and then
   
-  analogWrite(CONTROL_PIN, Output);           // turn on again heater
+  analogWrite(CONTROL_PIN, HEATER_PWM);       // turn on again heater
   
-  RawTemp += (temp - RawTemp) * 0.05;         // stabilize ADC temperature reading
+  RawTemp += (temp - RawTemp) * SMOOTHIE;     // stabilize ADC temperature reading
   calculateTemp();                            // calculate real temperature value
 
   // stabilize displayed temperature when around setpoint
-  if ((ShowTemp != Setpoint) || (abs(ShowTemp - CurrentTemp) > 3)) ShowTemp = CurrentTemp;
+  if ((ShowTemp != Setpoint) || (abs(ShowTemp - CurrentTemp) > 5)) ShowTemp = CurrentTemp;
+  if (abs(ShowTemp - Setpoint) <= 1) ShowTemp = Setpoint;
 
   // set state variable if temperature is in working range; beep if working temperature was just reached
   gap = abs(SetTemp - CurrentTemp);
@@ -323,13 +370,28 @@ void SENSORCheck() {
     beepIfWorky = false;
   }
   else isWorky = false;
+
+  // checks if tip is present or currently inserted
+  if (ShowTemp > 500) TipIsPresent = false;   // tip removed ?
+  if (!TipIsPresent && (ShowTemp < 500)) {    // new tip inserted ?
+    analogWrite(CONTROL_PIN, HEATER_OFF);     // shut off heater
+    beep();                                   // beep for info
+    TipIsPresent = true;                      // tip is present now
+    ChangeTipScreen();                        // show tip selection screen
+    updateEEPROM();                           // update setting in EEPROM
+    handleMoved = true;                       // reset all timers
+    RawTemp  = denoiseAnalog(SENSOR_PIN);     // restart temp smooth algorithm
+    c0 = LOW;                                 // switch must be released
+    setRotary(TEMP_MIN, TEMP_MAX, TEMP_STEP, SetTemp);  // reset rotary encoder
+  }
 }
 
 
 // calculates real temperature value according to ADC reading and calibration values
 void calculateTemp() {
-  if (RawTemp < 280) CurrentTemp = map (RawTemp, 200, 280, CalTemp[CurrentTip][0], CalTemp[CurrentTip][1]);
-  else               CurrentTemp = map (RawTemp, 280, 360, CalTemp[CurrentTip][1], CalTemp[CurrentTip][2]);
+  if      (RawTemp < 200) CurrentTemp = map (RawTemp,   0, 200,                     21, CalTemp[CurrentTip][0]);
+  else if (RawTemp < 280) CurrentTemp = map (RawTemp, 200, 280, CalTemp[CurrentTip][0], CalTemp[CurrentTip][1]);
+  else                    CurrentTemp = map (RawTemp, 280, 360, CalTemp[CurrentTip][1], CalTemp[CurrentTip][2]);
 }
 
 
@@ -352,7 +414,7 @@ void Thermostat() {
     // turn on heater if current temperature is below setpoint
     if ((CurrentTemp + 0.5) < Setpoint) Output = 0; else Output = 255;
   }
-  analogWrite(CONTROL_PIN, Output);     // set heater PWM
+  analogWrite(CONTROL_PIN, HEATER_PWM);     // set heater PWM
 }
 
 
@@ -373,7 +435,7 @@ void beep(){
 void setRotary(int rmin, int rmax, int rstep, int rvalue) {
   countMin  = rmin << ROTARY_TYPE;
   countMax  = rmax << ROTARY_TYPE;
-  countStep = rstep;
+  countStep = ECReverse ? -rstep : rstep;
   count     = rvalue << ROTARY_TYPE;  
 }
 
@@ -397,11 +459,13 @@ void getEEPROM() {
     MainScrType =  EEPROM.read(10);
     PIDenable   =  EEPROM.read(11);
     beepEnable  =  EEPROM.read(12);
-    CurrentTip  =  EEPROM.read(13);
-    NumberOfTips = EEPROM.read(14);
+    BodyFlip    =  EEPROM.read(13);
+    ECReverse   =  EEPROM.read(14);
+    CurrentTip  =  EEPROM.read(15);
+    NumberOfTips = EEPROM.read(16);
 
     uint8_t i, j;
-    uint16_t counter = 15;
+    uint16_t counter = 17;
     for (i = 0; i < NumberOfTips; i++) {
       for (j = 0; j < TIPNAMELENGTH; j++) {
         TipName[i][j] = EEPROM.read(counter++);
@@ -432,11 +496,13 @@ void updateEEPROM() {
   EEPROM.update(10, MainScrType);
   EEPROM.update(11, PIDenable);
   EEPROM.update(12, beepEnable);
-  EEPROM.update(13, CurrentTip);
-  EEPROM.update(14, NumberOfTips);
+  EEPROM.update(13, BodyFlip);
+  EEPROM.update(14, ECReverse);
+  EEPROM.update(15, CurrentTip);
+  EEPROM.update(16, NumberOfTips);
 
   uint8_t i, j;
-  uint16_t counter = 15;
+  uint16_t counter = 17;
   for (i = 0; i < NumberOfTips; i++) {
     for (j = 0; j < TIPNAMELENGTH; j++) EEPROM.update(counter++, TipName[i][j]);
     for (j = 0; j < 4; j++) {
@@ -444,6 +510,13 @@ void updateEEPROM() {
       EEPROM.update(counter++, CalTemp[i][j] & 0xFF);
     }
   }
+}
+
+
+// check state and flip screen
+void SetFlip() {
+  if (BodyFlip) u8g.setRot180();
+  else          u8g.undoRotation();
 }
 
 
@@ -492,7 +565,7 @@ void MainScreen() {
 
 // setup screen
 void SetupScreen() {
-  analogWrite(CONTROL_PIN, 255);      // shut off heater
+  analogWrite(CONTROL_PIN, HEATER_OFF);      // shut off heater
   beep();
   uint16_t SaveSetTemp = SetTemp;
   uint8_t selection = 0;
@@ -507,7 +580,9 @@ void SetupScreen() {
       case 3:   PIDenable = MenuScreen(ControlTypeItems, sizeof(ControlTypeItems), PIDenable); break;
       case 4:   MainScrType = MenuScreen(MainScreenItems, sizeof(MainScreenItems), MainScrType); break;
       case 5:   beepEnable = MenuScreen(BuzzerItems, sizeof(BuzzerItems), beepEnable); break;
-      case 6:   InfoScreen(); break;
+      case 6:   BodyFlip = MenuScreen(FlipItems, sizeof(FlipItems), BodyFlip); SetFlip(); break;
+      case 7:   ECReverse = MenuScreen(ECReverseItems, sizeof(ECReverseItems), ECReverse); break;
+      case 8:   InfoScreen(); break;
       default:  repeat = false; break;
     }
   }  
@@ -741,10 +816,10 @@ void CalibrationScreen() {
   beep(); delay (10);
   }
 
-  analogWrite(CONTROL_PIN, 255);              // shut off heater
-  delayMicroseconds(time2settle);             // wait for voltage to settle
+  analogWrite(CONTROL_PIN, HEATER_OFF);       // shut off heater
+  delayMicroseconds(TIME2SETTLE);             // wait for voltage to settle
   CalTempNew[3] = getChipTemp();              // read chip temperature
-  if ((CalTempNew[0] + 30 < CalTempNew[1]) && (CalTempNew[1] + 30 < CalTempNew[2])) {
+  if ((CalTempNew[0] + 10 < CalTempNew[1]) && (CalTempNew[1] + 10 < CalTempNew[2])) {
     if (MenuScreen(StoreItems, sizeof(StoreItems), 0)) {
       for (uint8_t i = 0; i < 4; i++) CalTemp[CurrentTip][i] = CalTempNew[i];
     }
@@ -779,7 +854,7 @@ void InputNameScreen() {
     beep(); delay (10);
   }
   TipName[CurrentTip][TIPNAMELENGTH - 1] = 0;
-  return value;
+  return;
 }
 
 
