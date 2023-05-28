@@ -6,7 +6,7 @@
 class EasyButton2 : public EasyButton
 {
 public:
-  EasyButton2(uint8_t pin, uint32_t longpress_duration) : EasyButton(pin) {
+  EasyButton2(uint8_t pin, uint32_t longpress_duration = 999999) : EasyButton(pin) {
     _lp_duration = longpress_duration;
     _last_last_change = 0;
   }
