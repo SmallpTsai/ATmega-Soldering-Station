@@ -52,6 +52,7 @@
                                 // (old cpp version of https://github.com/mblythe86/C-PID-Library/tree/master/PID_v1)
 #include <EEPROM.h>             // for storing user settings into EEPROM
 #include <avr/sleep.h>          // for sleeping during ADC sampling
+#include "EasyButton2.h"
 
 // Firmware version
 #define VERSION       "v1.9"
@@ -122,6 +123,8 @@
   #error Wrong MOSFET type!
 #endif
 
+#define LONGPRESS_DUR 500
+
 // Define the aggressive and conservative PID tuning parameters
 double aggKp=11, aggKi=0.5, aggKd=1;
 double consKp=11, consKi=3, consKd=5;
@@ -174,6 +177,7 @@ const char *MaxTipMessage[]    = { "Warning", "You reached", "maximum number", "
 // Variables for pin change interrupt
 volatile uint8_t  a0, b0, c0, d0;
 volatile bool     ab0;
+volatile bool     continueRotate; // true: max -> 0, 0 -> max, false: stop at 0 or max
 volatile int      count, countMin, countMax, countStep;
 volatile bool     handleMoved;
  
@@ -191,7 +195,7 @@ bool      inBoostMode = false;
 bool      inCalibMode = false;
 bool      isWorky     = true;
 bool      beepIfWorky = true;
-bool      TipIsPresent= true;
+bool      isTipPresent= true;
 
 // Timing variables
 uint32_t  sleepmillis;
@@ -213,8 +217,11 @@ PID ctrl(&Input, &Output, &Setpoint, aggKp, aggKi, aggKd, REVERSE);
   #error Wrong OLED controller type!
 #endif
 
+EasyButton2 button(BUTTON_PIN, LONGPRESS_DUR);
 
 void setup() { 
+  Serial.begin(115200);
+
   // set the pin modes
   pinMode(SENSOR_PIN,   INPUT);
   pinMode(VIN_PIN,      INPUT);
@@ -222,7 +229,6 @@ void setup() {
   pinMode(CONTROL_PIN,  OUTPUT);
   pinMode(ROTARY_1_PIN, INPUT_PULLUP);
   pinMode(ROTARY_2_PIN, INPUT_PULLUP);
-  pinMode(BUTTON_PIN,   INPUT_PULLUP);
   pinMode(SWITCH_PIN,   INPUT_PULLUP);
   
   analogWrite(CONTROL_PIN, HEATER_OFF); // this shuts off the heater
@@ -268,10 +274,12 @@ void setup() {
 
   // set initial rotary encoder values
   a0 = PINB & 1; b0 = PIND>>7 & 1; ab0 = (a0 == b0);
-  setRotary(TEMP_MIN, TEMP_MAX, TEMP_STEP, DefaultTemp);
+  setRotary(TEMP_MIN, TEMP_MAX, TEMP_STEP, DefaultTemp, false);
   
   // reset sleep timer
   sleepmillis = millis();
+
+  button.begin();
 
   // long beep for setup completion
   beep(); beep();
@@ -295,19 +303,16 @@ void ROTARYCheck() {
   SetTemp = getRotary();
   
   // check rotary encoder switch
-  uint8_t c = digitalRead(BUTTON_PIN);
-  if ( !c && c0 ) {
+  button.read();
+  if(button.wasLongPressed()) {
     beep();
-    buttonmillis = millis();
-    while( (!digitalRead(BUTTON_PIN)) && ((millis() - buttonmillis) < 500) );
-    if ((millis() - buttonmillis) >= 500) SetupScreen();
-    else {
-      inBoostMode = !inBoostMode;
-      if (inBoostMode) boostmillis = millis();
-      handleMoved = true;
-    }
+    SetupScreen();
+  } else if (button.wasReleasedFromPress()) {
+    beep();
+    inBoostMode = !inBoostMode;
+    if (inBoostMode) boostmillis = millis();
+    handleMoved = true;
   }
-  c0 = c;
 
   // check timer when in boost mode
   if (inBoostMode && timeOfBoost) {
@@ -372,17 +377,17 @@ void SENSORCheck() {
   else isWorky = false;
 
   // checks if tip is present or currently inserted
-  if (ShowTemp > 500) TipIsPresent = false;   // tip removed ?
-  if (!TipIsPresent && (ShowTemp < 500)) {    // new tip inserted ?
+  if (ShowTemp > 500) isTipPresent = false;   // tip removed ?
+  if (!isTipPresent && (ShowTemp < 500)) {    // new tip inserted ?
     analogWrite(CONTROL_PIN, HEATER_OFF);     // shut off heater
     beep();                                   // beep for info
-    TipIsPresent = true;                      // tip is present now
+    isTipPresent = true;                      // tip is present now
     ChangeTipScreen();                        // show tip selection screen
     updateEEPROM();                           // update setting in EEPROM
     handleMoved = true;                       // reset all timers
     RawTemp  = denoiseAnalog(SENSOR_PIN);     // restart temp smooth algorithm
     c0 = LOW;                                 // switch must be released
-    setRotary(TEMP_MIN, TEMP_MAX, TEMP_STEP, SetTemp);  // reset rotary encoder
+    setRotary(TEMP_MIN, TEMP_MAX, TEMP_STEP, SetTemp, false);  // reset rotary encoder
   }
 }
 
@@ -432,11 +437,12 @@ void beep(){
 
 
 // sets start values for rotary encoder
-void setRotary(int rmin, int rmax, int rstep, int rvalue) {
+void setRotary(int rmin, int rmax, int rstep, int rvalue, bool cont) {
   countMin  = rmin << ROTARY_TYPE;
   countMax  = rmax << ROTARY_TYPE;
   countStep = ECReverse ? -rstep : rstep;
-  count     = rvalue << ROTARY_TYPE;  
+  count     = rvalue << ROTARY_TYPE;
+  continueRotate = cont;
 }
 
 
@@ -543,15 +549,23 @@ void MainScreen() {
 
     // rest depending on main screen type
     if (MainScrType) {
-      // draw current tip and input voltage
-      float fVin = (float)Vin / 1000;     // convert mv in V
-      u8g.setPrintPos( 0,52); u8g.print(TipName[CurrentTip]);
-      u8g.setPrintPos(83,52); u8g.print(fVin, 1); u8g.print(F("V"));
-      // draw current temperature
-      u8g.setFont(u8g_font_freedoomr25n);
-      u8g.setFontPosTop();
-      u8g.setPrintPos(37,22);
-      if (ShowTemp > 500) u8g.print(F("000")); else u8g.print(ShowTemp);
+      if (isTipPresent) {
+        // draw current tip and input voltage
+        u8g.setPrintPos( 0,52); u8g.print(TipName[CurrentTip]);
+        u8g.setPrintPos(83,52); u8g.print((float)Vin / 1000, 1); u8g.print(F("V")); // convert mv in V
+        // draw current temperature
+        u8g.setFont(u8g_font_freedoomr25n);
+        u8g.setFontPosTop();
+        u8g.setPrintPos(37,22);
+        u8g.print(ShowTemp);
+      } else {
+        // draw current tip and input voltage
+        u8g.setPrintPos(83,52); u8g.print((float)Vin / 1000, 1); u8g.print(F("V")); // convert mv in V
+#define PROMPT_INSERT_TIP "[Insert Tip]"
+        auto w = u8g.getStrWidth(PROMPT_INSERT_TIP);
+        auto h = u8g.getFontAscent() - u8g.getFontDescent();
+        u8g.setPrintPos((128-w)/2,(64-h)/2); u8g.print(PROMPT_INSERT_TIP);
+      }
     } else {
       // draw current temperature in big figures
       u8g.setFont(u8g_font_fub42n);
@@ -589,7 +603,7 @@ void SetupScreen() {
   updateEEPROM();
   handleMoved = true;
   SetTemp = SaveSetTemp;
-  setRotary(TEMP_MIN, TEMP_MAX, TEMP_STEP, SetTemp);
+  setRotary(TEMP_MIN, TEMP_MAX, TEMP_STEP, SetTemp, false);
 }
 
 
@@ -618,11 +632,11 @@ void TempScreen() {
   while (repeat) {
     selection = MenuScreen(TempItems, sizeof(TempItems), selection);
     switch (selection) {
-      case 0:   setRotary(TEMP_MIN, TEMP_MAX, TEMP_STEP, DefaultTemp);
+      case 0:   setRotary(TEMP_MIN, TEMP_MAX, TEMP_STEP, DefaultTemp, false);
                 DefaultTemp = InputScreen(DefaultTempItems); break;
-      case 1:   setRotary(20, 200, TEMP_STEP, SleepTemp);
+      case 1:   setRotary(20, 200, TEMP_STEP, SleepTemp, false);
                 SleepTemp = InputScreen(SleepTempItems); break;
-      case 2:   setRotary(10, 100, TEMP_STEP, BoostTemp);
+      case 2:   setRotary(10, 100, TEMP_STEP, BoostTemp, false);
                 BoostTemp = InputScreen(BoostTempItems); break;
       default:  repeat = false; break;
     }
@@ -637,11 +651,11 @@ void TimerScreen() {
   while (repeat) {
     selection = MenuScreen(TimerItems, sizeof(TimerItems), selection);
     switch (selection) {
-      case 0:   setRotary(0, 30, 1, time2sleep);
+      case 0:   setRotary(0, 30, 1, time2sleep, false);
                 time2sleep = InputScreen(SleepTimerItems); break;
-      case 1:   setRotary(0, 60, 5, time2off);
+      case 1:   setRotary(0, 60, 5, time2off, false);
                 time2off = InputScreen(OffTimerItems); break;
-      case 2:   setRotary(0, 180, 10, timeOfBoost);
+      case 2:   setRotary(0, 180, 10, timeOfBoost, false);
                 timeOfBoost = InputScreen(BoostTimerItems); break;
       default:  repeat = false; break;
     }
@@ -656,28 +670,27 @@ uint8_t MenuScreen(const char *Items[], uint8_t numberOfItems, uint8_t selected)
   int8_t  arrow = 0;
   if (selected) arrow = 1;
   numberOfItems >>= 1;
-  setRotary(0, numberOfItems - 2, 1, selected);
-  bool    lastbutton = (!digitalRead(BUTTON_PIN));
-
+  setRotary(0, numberOfItems - 2, 1, selected, true);
   do {
     selected = getRotary();
     arrow = constrain(arrow + selected - lastselected, 0, 2);
     lastselected = selected;
     u8g.firstPage();
-      do {
-        u8g.setFont(u8g_font_9x15);
-        u8g.setFontPosTop();
-        u8g.drawStr( 0, 0,  Items[0]);
-        if (isTipScreen) u8g.drawStr( 54, 0,  TipName[CurrentTip]);
-        u8g.drawStr( 0, 16 * (arrow + 1), ">");
-        for (uint8_t i=0; i<3; i++) {
-          uint8_t drawnumber = selected + i + 1 - arrow;
-          if (drawnumber < numberOfItems)
-            u8g.drawStr( 12, 16 * (i + 1), Items[selected + i + 1 - arrow]);
-        }
-      } while(u8g.nextPage());
-    if (lastbutton && digitalRead(BUTTON_PIN)) {delay(10); lastbutton = false;}
-  } while (digitalRead(BUTTON_PIN) || lastbutton);
+    do {
+      u8g.setFont(u8g_font_9x15);
+      u8g.setFontPosTop();
+      u8g.drawStr( 0, 0,  Items[0]);
+      if (isTipScreen) u8g.drawStr( 54, 0,  TipName[CurrentTip]);
+      u8g.drawStr( 0, 16 * (arrow + 1), ">");
+      for (uint8_t i=0; i<3; i++) {
+        uint8_t drawnumber = selected + i + 1 - arrow;
+        if (drawnumber < numberOfItems)
+          u8g.drawStr( 12, 16 * (i + 1), Items[selected + i + 1 - arrow]);
+      }
+    } while(u8g.nextPage());
+
+    button.read();
+  } while (!button.wasReleasedFromPress());
 
   beep();
   return selected;
@@ -685,7 +698,6 @@ uint8_t MenuScreen(const char *Items[], uint8_t numberOfItems, uint8_t selected)
 
 
 void MessageScreen(const char *Items[], uint8_t numberOfItems) {
-  bool lastbutton = (!digitalRead(BUTTON_PIN));
   u8g.firstPage();
   do {
     u8g.setFont(u8g_font_9x15);
@@ -693,8 +705,8 @@ void MessageScreen(const char *Items[], uint8_t numberOfItems) {
     for (uint8_t i = 0; i < numberOfItems; i++) u8g.drawStr( 0, i * 16,  Items[i]);
   } while(u8g.nextPage());
   do {
-    if (lastbutton && digitalRead(BUTTON_PIN)) {delay(10); lastbutton = false;}
-  } while (digitalRead(BUTTON_PIN) || lastbutton);
+    button.read();
+  } while (!button.wasReleasedFromPress());
   beep();
 }
 
@@ -702,21 +714,20 @@ void MessageScreen(const char *Items[], uint8_t numberOfItems) {
 // input value screen
 uint16_t InputScreen(const char *Items[]) {
   uint16_t  value;
-  bool      lastbutton = (!digitalRead(BUTTON_PIN));
 
   do {
     value = getRotary();
     u8g.firstPage();
-      do {
-        u8g.setFont(u8g_font_9x15);
-        u8g.setFontPosTop();
-        u8g.drawStr( 0, 0,  Items[0]);
-        u8g.setPrintPos(0, 32); u8g.print(">"); u8g.setPrintPos(10, 32);        
-        if (value == 0)  u8g.print(F("Deactivated"));
-        else            {u8g.print(value);u8g.print(" ");u8g.print(Items[1]);}
-      } while(u8g.nextPage());
-    if (lastbutton && digitalRead(BUTTON_PIN)) {delay(10); lastbutton = false;}
-  } while (digitalRead(BUTTON_PIN) || lastbutton);
+    do {
+      u8g.setFont(u8g_font_9x15);
+      u8g.setFontPosTop();
+      u8g.drawStr( 0, 0,  Items[0]);
+      u8g.setPrintPos(0, 32); u8g.print(">"); u8g.setPrintPos(10, 32);        
+      if (value == 0)  u8g.print(F("Deactivated"));
+      else            {u8g.print(value);u8g.print(" ");u8g.print(Items[1]);}
+    } while(u8g.nextPage());
+    button.read();
+  } while (!button.wasReleasedFromPress());
 
   beep();
   return value;
@@ -725,7 +736,6 @@ uint16_t InputScreen(const char *Items[]) {
 
 // information display screen
 void InfoScreen() {
-  bool lastbutton = (!digitalRead(BUTTON_PIN));
 
   do {
     Vcc = getVCC();                     // read input voltage
@@ -734,16 +744,16 @@ void InfoScreen() {
     float fVin = (float)Vin / 1000;     // convert mv in V
     float fTmp = getChipTemp();         // read cold junction temperature
     u8g.firstPage();
-      do {
-        u8g.setFont(u8g_font_9x15);
-        u8g.setFontPosTop();
-        u8g.setPrintPos(0,  0); u8g.print(F("Firmware: ")); u8g.print(VERSION);
-        u8g.setPrintPos(0, 16); u8g.print(F("Tmp: "));  u8g.print(fTmp, 1); u8g.print(F(" C"));
-        u8g.setPrintPos(0, 32); u8g.print(F("Vin: "));  u8g.print(fVin, 1); u8g.print(F(" V"));
-        u8g.setPrintPos(0, 48); u8g.print(F("Vcc:  ")); u8g.print(fVcc, 1); u8g.print(F(" V"));
-      } while(u8g.nextPage());
-    if (lastbutton && digitalRead(BUTTON_PIN)) {delay(10); lastbutton = false;}
-  } while (digitalRead(BUTTON_PIN) || lastbutton);
+    do {
+      u8g.setFont(u8g_font_9x15);
+      u8g.setFontPosTop();
+      u8g.setPrintPos(0,  0); u8g.print(F("Firmware: ")); u8g.print(VERSION);
+      u8g.setPrintPos(0, 16); u8g.print(F("Tmp: "));  u8g.print(fTmp, 1); u8g.print(F(" C"));
+      u8g.setPrintPos(0, 32); u8g.print(F("Vin: "));  u8g.print(fVin, 1); u8g.print(F(" V"));
+      u8g.setPrintPos(0, 48); u8g.print(F("Vcc:  ")); u8g.print(fVcc, 1); u8g.print(F(" V"));
+    } while(u8g.nextPage());
+    button.read();
+  } while (!button.wasReleasedFromPress());
 
   beep();
 }
@@ -755,27 +765,26 @@ void ChangeTipScreen() {
   uint8_t lastselected = selected;
   int8_t  arrow = 0;
   if (selected) arrow = 1;
-  setRotary(0, NumberOfTips - 1, 1, selected);
-  bool    lastbutton = (!digitalRead(BUTTON_PIN));
+  setRotary(0, NumberOfTips - 1, 1, selected, true);
 
   do {
     selected = getRotary();
     arrow = constrain(arrow + selected - lastselected, 0, 2);
     lastselected = selected;
     u8g.firstPage();
-      do {
-        u8g.setFont(u8g_font_9x15);
-        u8g.setFontPosTop();
-        u8g.drawStr( 0, 0,  F("Select Tip"));
-        u8g.drawStr( 0, 16 * (arrow + 1), ">");
-        for (uint8_t i=0; i<3; i++) {
-          uint8_t drawnumber = selected + i - arrow;
-          if (drawnumber < NumberOfTips)
-            u8g.drawStr( 12, 16 * (i + 1), TipName[selected + i - arrow]);
-        }
-      } while(u8g.nextPage());
-    if (lastbutton && digitalRead(BUTTON_PIN)) {delay(10); lastbutton = false;}
-  } while (digitalRead(BUTTON_PIN) || lastbutton);
+    do {
+      u8g.setFont(u8g_font_9x15);
+      u8g.setFontPosTop();
+      u8g.drawStr( 0, 0,  F("Select Tip"));
+      u8g.drawStr( 0, 16 * (arrow + 1), ">");
+      for (uint8_t i=0; i<3; i++) {
+        uint8_t drawnumber = selected + i - arrow;
+        if (drawnumber < NumberOfTips)
+          u8g.drawStr( 12, 16 * (i + 1), TipName[selected + i - arrow]);
+      }
+    } while(u8g.nextPage());
+    button.read();
+  } while (!button.wasReleasedFromPress());
 
   beep();
   CurrentTip = selected;
@@ -787,9 +796,8 @@ void CalibrationScreen() {
   uint16_t CalTempNew[4]; 
   for (uint8_t CalStep = 0; CalStep < 3; CalStep++) {
     SetTemp = CalTemp[CurrentTip][CalStep];
-    setRotary(100, 500, 1, SetTemp);
+    setRotary(100, 500, 1, SetTemp, false);
     beepIfWorky = true;
-    bool    lastbutton = (!digitalRead(BUTTON_PIN));
 
     do {
       SENSORCheck();      // reads temperature and vibration switch of the iron
@@ -809,11 +817,11 @@ void CalibrationScreen() {
           u8g.setPrintPos(0, 48); u8g.print(F("Please wait..."));
         }
       } while(u8g.nextPage());
-    if (lastbutton && digitalRead(BUTTON_PIN)) {delay(10); lastbutton = false;}
-    } while (digitalRead(BUTTON_PIN) || lastbutton);
+      button.read();
+    } while (!button.wasReleasedFromPress());
 
-  CalTempNew[CalStep] = getRotary();
-  beep(); delay (10);
+    CalTempNew[CalStep] = getRotary();
+    beep(); delay (10);
   }
 
   analogWrite(CONTROL_PIN, HEATER_OFF);       // shut off heater
@@ -826,30 +834,26 @@ void CalibrationScreen() {
   }
 }
 
-
 // input tip name screen
 void InputNameScreen() {
   uint8_t  value;
 
   for (uint8_t digit = 0; digit < (TIPNAMELENGTH - 1); digit++) {
-    bool      lastbutton = (!digitalRead(BUTTON_PIN));
-    setRotary(31, 96, 1, 65);
+    setRotary(32, 96, 1, 65, true);
     do {
       value = getRotary();
-      if (value == 31) {value = 95; setRotary(31, 96, 1, 95);}
-      if (value == 96) {value = 32; setRotary(31, 96, 1, 32);}
       u8g.firstPage();
-        do {
-          u8g.setFont(u8g_font_9x15);
-          u8g.setFontPosTop();
-          u8g.drawStr( 0, 0,  F("Enter Tip Name"));
-          u8g.setPrintPos(9 * digit, 48); u8g.print(char(94));
-          u8g.setPrintPos(0, 32);
-          for (uint8_t i = 0; i < digit; i++) u8g.print(TipName[CurrentTip][i]);
-          u8g.setPrintPos(9 * digit, 32); u8g.print(char(value));
-        } while(u8g.nextPage());
-      if (lastbutton && digitalRead(BUTTON_PIN)) {delay(10); lastbutton = false;}
-    } while (digitalRead(BUTTON_PIN) || lastbutton);
+      do {
+        u8g.setFont(u8g_font_9x15);
+        u8g.setFontPosTop();
+        u8g.drawStr( 0, 0,  F("Enter Tip Name"));
+        u8g.setPrintPos(9 * digit, 48); u8g.print(char(94));
+        u8g.setPrintPos(0, 32);
+        for (uint8_t i = 0; i < digit; i++) u8g.print(TipName[CurrentTip][i]);
+        u8g.setPrintPos(9 * digit, 32); u8g.print(char(value));
+      } while(u8g.nextPage());
+      button.read();
+    } while (!button.wasReleasedFromPress());
     TipName[CurrentTip][digit] = value;
     beep(); delay (10);
   }
@@ -959,9 +963,18 @@ ISR (PCINT0_vect) {
     a0 = a;
     if (b != b0) {            // B changed
       b0 = b;
-      count = constrain(count + ((a == b) ? countStep : -countStep), countMin, countMax);
-      if (ROTARY_TYPE && ((a == b) != ab0)) {
-        count = constrain(count + ((a == b) ? countStep : -countStep), countMin, countMax);;
+
+      uint8_t multiplier = (ROTARY_TYPE && ((a == b) != ab0)) ? 2 : 1;
+
+      if(continueRotate) {
+        auto jump = countMax - countMin + (1 << ROTARY_TYPE);
+        count = count + ((a == b) ? countStep * multiplier : -countStep * multiplier);
+        if((a == b) && (count > countMax))
+          count -= jump;
+        else if ((a != b) && (count < countMin))
+          count += jump;
+      } else {
+        count = constrain(count + ((a == b) ? countStep * multiplier : -countStep * multiplier), countMin, countMax);
       }
       ab0 = (a == b);
       handleMoved = true;
